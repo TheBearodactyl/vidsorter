@@ -512,9 +512,13 @@ def process_media_files():
         display_final_summary(stats, logger)
 
 
-if __name__ == "__main__":
+def main():
     try:
         process_media_files()
     except Exception as e:
         console.print(f"[red]💥 Fatal error: {e}[/red]")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

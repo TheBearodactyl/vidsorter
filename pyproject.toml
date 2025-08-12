@@ -10,3 +10,10 @@ dependencies = [
     "structlog>=25.4.0",
     "yt-dlp>=2025.8.11",
 ]
+
+[build-system]
+requires = ["uv_build >= 0.7.19, <0.9.0"]
+build-backend = "uv_build"
+
+[project.scripts]
+vidsorter = "vidsorter.cli:main"
