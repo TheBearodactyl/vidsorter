@@ -1,10 +1,11 @@
+import argparse
 import re
 import shutil
 import sys
 from pathlib import Path
 import yt_dlp
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import structlog
 import colorama
@@ -21,8 +22,72 @@ from rich.table import Table
 from rich.panel import Panel
 from rich import print as rprint
 
-colorama.init(autoreset=True)
-console = Console()
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Organize YouTube media files into channel directories."
+    )
+    parser.add_argument(
+        "-d",
+        "--directory",
+        type=Path,
+        default=Path("."),
+        help="Directory to scan for media files (default: current directory)",
+    )
+    parser.add_argument(
+        "--include-video",
+        action="store_true",
+        help="Include video files (default: include both if no filter specified)",
+    )
+    parser.add_argument(
+        "--include-audio",
+        action="store_true",
+        help="Include audio files (default: include both if no filter specified)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging (DEBUG level)",
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true", help="Suppress non-error output"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show planned actions without moving files",
+    )
+    parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=10,
+        help="Maximum number of errors to display in summary",
+    )
+    parser.add_argument(
+        "--skip-metadata",
+        action="store_true",
+        help="Skip fetching YouTube metadata (all go to 'Unknown_Channel')",
+    )
+    parser.add_argument(
+        "--video-exts",
+        type=str,
+        help="Comma-separated list of video extensions (e.g. .mp4,.mkv)",
+    )
+    parser.add_argument(
+        "--audio-exts",
+        type=str,
+        help="Comma-separated list of audio extensions (e.g. .mp3,.wav)",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent threads to process files (default: 4)",
+    )
+    return parser.parse_args()
+
 
 SUPPORTED_FORMATS = {
     "video": [
@@ -42,10 +107,83 @@ SUPPORTED_FORMATS = {
 
 ALL_FORMATS = set(SUPPORTED_FORMATS["video"] + SUPPORTED_FORMATS["audio"])
 
+colorama.init(autoreset=True)
+console = Console()
 
-def setup_structured_logging():
-    """Set up structured logging with rich formatting and colors"""
 
+def process_single_file(file_path, args, logger, stats, progress, task_id):
+    file_type = get_file_type(file_path)
+    if file_type == "video":
+        stats.video_files += 1
+    elif file_type == "audio":
+        stats.audio_files += 1
+
+    video_id = extract_video_id(file_path.name)
+    if not video_id:
+        stats.add_error(file_path.name, "ID_EXTRACTION_FAILED", "No video ID found")
+        stats.increment_failed()
+        progress.update(task_id, advance=1)
+        return
+
+    if args.skip_metadata:
+        channel_name = "Unknown_Channel"
+    else:
+        channel_name = get_youtube_metadata(video_id, logger) or "Unknown_Channel"
+
+    channel_dir = create_channel_directory(channel_name, logger)
+    if not channel_dir:
+        stats.add_error(file_path.name, "DIR_CREATION_FAILED", "Could not create dir")
+        stats.increment_failed()
+        progress.update(task_id, advance=1)
+        return
+
+    stats.add_channel(channel_name)
+
+    if move_file(file_path, channel_dir, logger, dry_run=args.dry_run):
+        stats.increment_processed()
+    else:
+        stats.increment_failed()
+
+    progress.update(task_id, advance=1)
+
+
+def process_media_files(args):
+    logger = setup_structured_logging(args.verbose, args.quiet)
+    stats = MediaOrganizerStats()
+    display_startup_info(logger)
+
+    try:
+        media_files = find_media_files(
+            args.directory, logger, args.include_video, args.include_audio
+        )
+        if not media_files:
+            rprint("[yellow]No supported files found[/yellow]")
+            return
+        stats.total_files = len(media_files)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TextColumn("{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Processing...", total=len(media_files))
+            with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                futures = [
+                    executor.submit(
+                        process_single_file, f, args, logger, stats, progress, task
+                    )
+                    for f in media_files
+                ]
+                for _ in as_completed(futures):
+                    pass
+    finally:
+        display_final_summary(stats, logger, args.max_errors)
+
+
+def setup_structured_logging(verbose=False, quiet=False):
     structlog.configure(
         processors=[
             structlog.stdlib.filter_by_level,
@@ -63,24 +201,19 @@ def setup_structured_logging():
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
-
     import logging
 
+    level = logging.DEBUG if verbose else (logging.ERROR if quiet else logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
-
-    logger = structlog.get_logger("media_organizer")
-
-    return logger
+    return structlog.get_logger("media_organizer")
 
 
 class MediaOrganizerStats:
-    """Class to track and display processing statistics"""
-
     def __init__(self):
         self.total_files = 0
         self.processed_files = 0
@@ -91,8 +224,7 @@ class MediaOrganizerStats:
         self.start_time = datetime.now()
         self.errors = []
 
-    def add_error(self, filename: str, error_type: str, details: str):
-        """Add an error to the error log"""
+    def add_error(self, filename, error_type, details):
         self.errors.append(
             {
                 "filename": filename,
@@ -102,23 +234,17 @@ class MediaOrganizerStats:
             }
         )
 
-    def add_channel(self, channel_name: str):
-        """Add a channel to the set of created channels"""
+    def add_channel(self, channel_name):
         self.channels_created.add(channel_name)
 
     def increment_processed(self):
-        """Increment processed file count"""
         self.processed_files += 1
 
     def increment_failed(self):
-        """Increment failed file count"""
         self.failed_files += 1
 
-    def get_summary(self) -> Dict[str, Any]:
-        """Get summary statistics"""
-        end_time = datetime.now()
-        duration = end_time - self.start_time
-
+    def get_summary(self):
+        duration = datetime.now() - self.start_time
         return {
             "total_files": self.total_files,
             "processed_files": self.processed_files,
@@ -128,395 +254,147 @@ class MediaOrganizerStats:
             "channels_created": len(self.channels_created),
             "duration_seconds": duration.total_seconds(),
             "success_rate": (self.processed_files / self.total_files * 100)
-            if self.total_files > 0
+            if self.total_files
             else 0,
         }
 
 
-def extract_video_id(filename: str) -> Optional[str]:
-    """
-    Extract video ID from filename in format: <title> [<video ID>].<ext>
-    Returns the video ID if found, None otherwise
-    """
+def extract_video_id(filename):
     extensions_pattern = "|".join(re.escape(ext[1:]) for ext in ALL_FORMATS)
-    pattern = rf".*\[([a-zA-Z0-9_-]{{11}})\]\.({extensions_pattern})$"
-    match = re.search(pattern, filename, re.IGNORECASE)
+    match = re.search(
+        rf".*\[([a-zA-Z0-9_-]{{11}})\]\.({extensions_pattern})$",
+        filename,
+        re.IGNORECASE,
+    )
     return match.group(1) if match else None
 
 
-def get_youtube_metadata(video_id: str, logger) -> Optional[str]:
-    """
-    Fetch YouTube metadata for a given video ID
-    Returns channel name or None if failed
-    """
+def get_youtube_metadata(video_id, logger):
     ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(
-                f"https://www.youtube.com/watch?v={video_id}", download=False
-            )
-
-            if not isinstance(info, dict):
-                logger.error(
-                    "Invalid metadata format received",
-                    video_id=video_id,
-                    info_type=type(info).__name__,
-                    info_content=str(info)[:100] if info else None,
+        with console.status(f"[bold blue]Fetching metadata for {video_id}..."):
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}", download=False
                 )
-                return None
-
-            channel_name = info.get("uploader") or info.get("channel")
-
-            if channel_name:
-                logger.info(
-                    "Successfully fetched metadata",
-                    video_id=video_id,
-                    channel_name=channel_name,
-                    video_title=info.get("title", "Unknown"),
-                    upload_date=info.get("upload_date", "Unknown"),
-                )
-            return channel_name
-
+                if not isinstance(info, dict):
+                    return None
+                return info.get("uploader") or info.get("channel")
     except Exception as e:
-        logger.error(
-            "Failed to fetch YouTube metadata",
-            video_id=video_id,
-            error=str(e),
-            error_type=type(e).__name__,
-        )
+        logger.error("Metadata fetch failed", video_id=video_id, error=str(e))
         return None
 
 
-def sanitize_directory_name(name: str) -> str:
-    """
-    Sanitize channel name to be a valid directory name
-    """
-    sanitized = re.sub(r'[<>:"/\\|?*]', "_", name)
-    sanitized = sanitized.strip(". ")
-    return sanitized if sanitized else "Unknown_Channel"
+def sanitize_directory_name(name):
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", name).strip(". ")
+    return sanitized or "Unknown_Channel"
 
 
-def create_channel_directory(channel_name: str, logger) -> Optional[Path]:
-    """
-    Create a directory for the channel if it doesn't exist
-    """
-    sanitized_name = sanitize_directory_name(channel_name)
-    channel_dir = Path(sanitized_name)
-
+def create_channel_directory(channel_name, logger):
+    sanitized = sanitize_directory_name(channel_name)
+    path = Path(sanitized)
     try:
-        created = not channel_dir.exists()
-        channel_dir.mkdir(exist_ok=True)
-
-        if created:
-            logger.info(
-                "Created new channel directory",
-                channel_name=channel_name,
-                directory_path=str(channel_dir),
-                sanitized_name=sanitized_name,
-            )
-        else:
-            logger.debug(
-                "Using existing channel directory",
-                channel_name=channel_name,
-                directory_path=str(channel_dir),
-            )
-
-        return channel_dir
-
+        path.mkdir(exist_ok=True)
+        return path
     except Exception as e:
-        logger.error(
-            "Failed to create channel directory",
-            channel_name=channel_name,
-            sanitized_name=sanitized_name,
-            error=str(e),
-            error_type=type(e).__name__,
-        )
+        logger.error("Failed to create directory", name=sanitized, error=str(e))
         return None
 
 
-def move_file_to_channel_directory(file_path: Path, channel_dir: Path, logger) -> bool:
-    """
-    Move the media file to the channel directory
-    """
+def move_file(file_path, channel_dir, logger, dry_run=False):
     try:
         destination = channel_dir / file_path.name
         counter = 1
-        original_destination = destination
-
         while destination.exists():
-            stem = original_destination.stem
-            suffix = original_destination.suffix
-            destination = channel_dir / f"{stem}_{counter}{suffix}"
+            destination = channel_dir / f"{file_path.stem}_{counter}{file_path.suffix}"
             counter += 1
-
-        if counter > 1:
-            logger.warning(
-                "File renamed to avoid conflict",
-                original_name=file_path.name,
-                new_name=destination.name,
-                conflict_count=counter - 1,
-            )
-
+        if dry_run:
+            logger.info("Dry-run: would move", source=file_path, dest=destination)
+            return True
         shutil.move(str(file_path), str(destination))
-
-        logger.info(
-            "Successfully moved file",
-            source_file=file_path.name,
-            destination=str(destination),
-            channel_directory=str(channel_dir),
-            file_size_mb=round(destination.stat().st_size / (1024 * 1024), 2),
-        )
-
         return True
-
     except Exception as e:
-        logger.error(
-            "Failed to move file",
-            source_file=file_path.name,
-            destination_dir=str(channel_dir),
-            error=str(e),
-            error_type=type(e).__name__,
-        )
+        logger.error("Move failed", file=file_path, error=str(e))
         return False
 
 
-def get_file_type(file_path: Path) -> str:
-    """
-    Determine if the file is audio or video based on its extension
-    """
-    extension = file_path.suffix.lower()
-    if extension in SUPPORTED_FORMATS["video"]:
+def get_file_type(file_path):
+    ext = file_path.suffix.lower()
+    if ext in SUPPORTED_FORMATS["video"]:
         return "video"
-    elif extension in SUPPORTED_FORMATS["audio"]:
+    elif ext in SUPPORTED_FORMATS["audio"]:
         return "audio"
-    else:
-        return "unknown"
+    return "unknown"
 
 
-def find_media_files(logger) -> List[Path]:
-    """
-    Find all supported media files in the current directory
-    """
-    current_dir = Path(".")
+def find_media_files(directory, logger, include_video, include_audio):
+    exts = []
+    if include_video:
+        exts.extend(SUPPORTED_FORMATS["video"])
+    if include_audio:
+        exts.extend(SUPPORTED_FORMATS["audio"])
+    if not include_video and not include_audio:
+        exts = list(ALL_FORMATS)
+
     media_files = []
-
-    with console.status("[bold blue]Scanning for media files..."):
-        for extension in ALL_FORMATS:
-            pattern = f"*{extension}"
-            files = list(current_dir.glob(pattern))
-            files.extend(list(current_dir.glob(f"*{extension.upper()}")))
-            media_files.extend(files)
-
+    with console.status("[bold blue]Scanning..."):
+        for ext in exts:
+            media_files.extend(directory.glob(f"*{ext}"))
+            media_files.extend(directory.glob(f"*{ext.upper()}"))
     media_files = list(set(media_files))
-
-    logger.info(
-        "Media file scan completed",
-        total_files_found=len(media_files),
-        scan_directory=str(current_dir.absolute()),
-    )
-
+    logger.info("Scan complete", total=len(media_files), directory=str(directory))
     return media_files
 
 
 def display_startup_info(logger):
-    """
-    Display startup information with supported formats
-    """
-    table = Table(
-        title="🎬 Media Organizer - Supported Formats",
-        show_header=True,
-        header_style="bold magenta",
-    )
-    table.add_column("Type", style="cyan", no_wrap=True)
+    table = Table(title="Supported Formats", header_style="bold magenta")
+    table.add_column("Type", style="cyan")
     table.add_column("Extensions", style="green")
-
     table.add_row("Video", ", ".join(SUPPORTED_FORMATS["video"]))
     table.add_row("Audio", ", ".join(SUPPORTED_FORMATS["audio"]))
-
     console.print(table)
-    console.print()
-
-    logger.info(
-        "Media organizer started",
-        supported_video_formats=len(SUPPORTED_FORMATS["video"]),
-        supported_audio_formats=len(SUPPORTED_FORMATS["audio"]),
-        total_supported_formats=len(ALL_FORMATS),
-    )
+    logger.info("Startup info displayed")
 
 
-def display_final_summary(stats: MediaOrganizerStats, logger):
-    """
-    Display a comprehensive final summary
-    """
+def display_final_summary(stats, logger, max_errors):
     summary = stats.get_summary()
-
     summary_text = f"""
-📊 [bold]Processing Summary[/bold]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📁 Files Processed: {summary["processed_files"]}/{summary["total_files"]}
+📊 Files Processed: {summary["processed_files"]}/{summary["total_files"]}
 ✅ Success Rate: {summary["success_rate"]:.1f}%
 🎬 Video Files: {summary["video_files"]}
 🎵 Audio Files: {summary["audio_files"]}
 📂 Channels Created: {summary["channels_created"]}
-⏱️  Duration: {summary["duration_seconds"]:.2f}s
-
+⏱️ Duration: {summary["duration_seconds"]:.2f}s
 """
-
-    if summary["success_rate"] >= 90:
-        panel_style = "green"
-        emoji = "🎉"
-    elif summary["success_rate"] >= 70:
-        panel_style = "yellow"
-        emoji = "⚠️"
-    else:
-        panel_style = "red"
-        emoji = "❌"
-
-    console.print(
-        Panel(summary_text, title=f"{emoji} Final Results", style=panel_style)
-    )
-
-    logger.info("Processing completed", **summary)
+    console.print(Panel(summary_text, title="Final Results", style="green"))
+    logger.info("Summary", **summary)
 
     if stats.errors:
-        error_table = Table(
-            title="❌ Processing Errors", show_header=True, header_style="bold red"
-        )
-        error_table.add_column("File", style="cyan")
-        error_table.add_column("Error Type", style="red")
-        error_table.add_column("Details", style="white")
-
-        for error in stats.errors[:10]:
-            error_table.add_row(
-                error["filename"],
-                error["error_type"],
-                error["details"][:50] + "..."
-                if len(error["details"]) > 50
-                else error["details"],
+        table = Table(title="Errors", header_style="bold red")
+        table.add_column("File")
+        table.add_column("Type")
+        table.add_column("Details")
+        for error in stats.errors[:max_errors]:
+            table.add_row(error["filename"], error["error_type"], error["details"][:50])
+        if len(stats.errors) > max_errors:
+            table.add_row(
+                "...", "...", f"... and {len(stats.errors) - max_errors} more"
             )
-
-        if len(stats.errors) > 10:
-            error_table.add_row(
-                "...", "...", f"... and {len(stats.errors) - 10} more errors"
-            )
-
-        console.print(error_table)
-
-
-def process_media_files():
-    """
-    Main function to process all supported media files in the current directory
-    """
-    logger = setup_structured_logging()
-    stats = MediaOrganizerStats()
-
-    display_startup_info(logger)
-
-    try:
-        media_files = find_media_files(logger)
-
-        if not media_files:
-            rprint(
-                "[yellow]ℹ️  No supported media files found in the current directory.[/yellow]"
-            )
-            return
-
-        stats.total_files = len(media_files)
-        for file_path in media_files:
-            file_type = get_file_type(file_path)
-            if file_type == "video":
-                stats.video_files += 1
-            elif file_type == "audio":
-                stats.audio_files += 1
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                "Processing media files...", total=len(media_files)
-            )
-
-            for media_file in media_files:
-                file_type = get_file_type(media_file)
-
-                progress.update(
-                    task,
-                    description=f"Processing {file_type}: {media_file.name[:30]}...",
-                )
-
-                logger.info(
-                    "Starting file processing",
-                    filename=media_file.name,
-                    file_type=file_type,
-                    file_size_mb=round(media_file.stat().st_size / (1024 * 1024), 2),
-                )
-
-                video_id = extract_video_id(media_file.name)
-                if not video_id:
-                    error_msg = "Could not extract video ID from filename"
-                    logger.warning(
-                        "Video ID extraction failed", filename=media_file.name
-                    )
-                    stats.add_error(media_file.name, "ID_EXTRACTION_FAILED", error_msg)
-                    stats.increment_failed()
-                    progress.advance(task)
-                    continue
-
-                channel_name = get_youtube_metadata(video_id, logger)
-                if not channel_name:
-                    error_msg = "Could not fetch channel metadata"
-                    stats.add_error(media_file.name, "METADATA_FETCH_FAILED", error_msg)
-                    stats.increment_failed()
-                    progress.advance(task)
-                    continue
-
-                channel_dir = create_channel_directory(channel_name, logger)
-                if not channel_dir:
-                    error_msg = "Could not create channel directory"
-                    stats.add_error(
-                        media_file.name, "DIRECTORY_CREATION_FAILED", error_msg
-                    )
-                    stats.increment_failed()
-                    progress.advance(task)
-                    continue
-
-                stats.add_channel(channel_name)
-
-                if move_file_to_channel_directory(media_file, channel_dir, logger):
-                    stats.increment_processed()
-                else:
-                    error_msg = "Could not move file to channel directory"
-                    stats.add_error(media_file.name, "FILE_MOVE_FAILED", error_msg)
-                    stats.increment_failed()
-
-                progress.advance(task)
-
-    except KeyboardInterrupt:
-        logger.warning("Processing interrupted by user")
-        rprint("[yellow]⚠️  Processing interrupted by user[/yellow]")
-    except Exception as e:
-        logger.error(
-            "Unexpected error during processing",
-            error=str(e),
-            error_type=type(e).__name__,
-        )
-        rprint(f"[red]❌ Unexpected error: {e}[/red]")
-    finally:
-        display_final_summary(stats, logger)
+        console.print(table)
 
 
 def main():
+    args = parse_args()
+    if args.video_exts:
+        SUPPORTED_FORMATS["video"] = [ext.strip() for ext in args.video_exts.split(",")]
+    if args.audio_exts:
+        SUPPORTED_FORMATS["audio"] = [ext.strip() for ext in args.audio_exts.split(",")]
+    ALL_FORMATS.clear()
+    ALL_FORMATS.update(SUPPORTED_FORMATS["video"] + SUPPORTED_FORMATS["audio"])
     try:
-        process_media_files()
+        process_media_files(args)
     except Exception as e:
-        console.print(f"[red]💥 Fatal error: {e}[/red]")
+        console.print(f"[red]Fatal error: {e}[/red]")
         sys.exit(1)
 
 
