@@ -1,0 +1,13 @@
+[project]
+name = "vidsorter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "colorama>=0.4.6",
+    "rich>=14.1.0",
+    "structlog>=25.4.0",
+    "structlog-pretty>=0.4.3",
+    "yt-dlp>=2025.8.11",
+]
